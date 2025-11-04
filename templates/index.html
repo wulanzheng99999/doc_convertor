@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文档转换服务</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>文档格式化转换工具</h1>
+        <form id="convertForm" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="documentFile">上传原文档 (DOCX格式):</label>
+                <input type="file" id="documentFile" name="file" accept=".docx" required>
+            </div>
+
+            <div class="form-group">
+                <label for="templateSelect">选择模板:</label>
+                <select id="templateSelect" name="document_type">
+                    <option value=1>初步设计</option>
+                    <option value=2>可行性研究</option>
+                    <option value=3>初步设计(代可行)</option>
+                    <option value=4>可行性研究(代初步)</option>
+                </select>
+            </div>
+
+<!--            <div class="form-group">-->
+<!--                <label for="headerText">页眉文本:</label>-->
+<!--                <input type="text" id="headerText" name="header_text" value="格式化文档">-->
+<!--            </div>-->
+
+<!--            <div class="form-group">-->
+<!--                <label for="tocTitle">目录标题:</label>-->
+<!--                <input type="text" id="tocTitle" name="toc_title" value="目 录">-->
+<!--            </div>-->
+
+            <div class="form-group">
+                <label for="saveIntermediate">是否保存中间文件:</label>
+                <select id="saveIntermediate" name="save_intermediate">
+                    <option value="false">否</option>
+                    <option value="true">是</option>
+                </select>
+            </div>
+
+            <button type="submit">转换文档</button>
+        </form>
+
+        <div id="logContainer" class="log-container" style="display:none;">
+            <h3>转换日志</h3>
+            <pre id="logOutput" class="log-output"></pre>
+            <button id="downloadBtn" class="download-btn" style="display:none;">下载转换后的文档</button>
+        </div>
+
+        <div id="result" class="result"></div>
+    </div>
+
+    <script>
+        let downloadBlob = null;
+        let downloadFilename = 'converted_document.docx';
+        let eventSource = null;
+
+        document.getElementById('convertForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData();
+            const documentFile = document.getElementById('documentFile').files[0];
+            const documentType = document.getElementById('templateSelect').value;
+            const headerText = "格式化文档";//document.getElementById('headerText').value;
+            const tocTitle = "目 录";//document.getElementById('tocTitle').value;
+            const saveIntermediate = document.getElementById('saveIntermediate').value;
+
+            if (!documentFile) {
+                showMessage('请选择要转换的文档', 'error');
+                return;
+            }
+
+            // 显示日志容器
+            const logContainer = document.getElementById('logContainer');
+            const logOutput = document.getElementById('logOutput');
+            const downloadBtn = document.getElementById('downloadBtn');
+            
+            logContainer.style.display = 'block';
+            logOutput.textContent = '开始转换...\n';
+            downloadBtn.style.display = 'none';
+
+            formData.append('file', documentFile);
+            if (documentType) {
+                formData.append('document_type', documentType);
+            }
+            formData.append('header_text', headerText);
+            formData.append('toc_title', tocTitle);
+            formData.append('save_intermediate', saveIntermediate);
+
+            const button = document.querySelector('button');
+            const originalButtonText = button.textContent;
+            button.textContent = '转换中...';
+            button.disabled = true;
+
+            try {
+                // 关闭之前的EventSource连接（如果有的话）
+                if (eventSource) {
+                    eventSource.close();
+                }
+
+                // 创建新的EventSource连接
+                const queryParams = new URLSearchParams();
+                // 我们需要使用fetch API来发送包含文件的请求，然后处理流式响应
+                const response = await fetch('/convert-document/', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok && response.body) {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder('utf-8');
+                    let buffer = '';
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+
+                        buffer += decoder.decode(value, { stream: true });
+                        
+                        // 处理完整的事件
+                        const lines = buffer.split('\n\n');
+                        buffer = lines.pop() || ''; // 保留不完整的行
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.slice(6));
+                                    if (data.type === 'log') {
+                                        logOutput.textContent += data.message;
+                                        logOutput.scrollTop = logOutput.scrollHeight;
+                                    } else if (data.type === 'complete') {
+                                        logOutput.textContent += '\n文档转换成功!\n';
+                                        logOutput.scrollTop = logOutput.scrollHeight;
+                                        downloadFilename = data.filename;
+                                        downloadBtn.style.display = 'block';
+                                    } else if (data.type === 'error') {
+                                        logOutput.textContent += `\n转换失败: ${data.message}\n`;
+                                        logOutput.scrollTop = logOutput.scrollHeight;
+                                    }
+                                } catch (e) {
+                                    console.error('解析事件数据时出错:', e);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    const errorText = await response.text();
+                    logOutput.textContent += `\n转换失败: ${errorText}\n`;
+                    logOutput.scrollTop = logOutput.scrollHeight;
+                }
+            } catch (error) {
+                logOutput.textContent += `\n请求失败: ${error.message}\n`;
+                logOutput.scrollTop = logOutput.scrollHeight;
+            } finally {
+                button.textContent = originalButtonText;
+                button.disabled = false;
+            }
+        });
+
+        // 下载按钮事件
+        document.getElementById('downloadBtn').addEventListener('click', function() {
+            // 通过重新请求来获取文件
+            const link = document.createElement('a');
+            link.href = `/result/${downloadFilename}`;
+            link.download = downloadFilename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        });
+
+        function showMessage(message, type) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.className = `result ${type}`;
+            resultDiv.innerHTML = `<p>${message}</p>`;
+            resultDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>

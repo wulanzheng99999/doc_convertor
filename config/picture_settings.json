@@ -1,0 +1,13 @@
+{
+    "picture_format": {
+        "alignment": "center",
+        "line_spacing": 1.0,
+        "before_spacing": 0,
+        "after_spacing": 0,
+        "keep_with_next": false,
+        "keep_lines": false,
+        "picture_width": null,
+        "picture_height": null,
+        "wrap_type": "inline"
+    }
+}
