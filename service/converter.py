@@ -33,6 +33,7 @@ from utils.pandoc_converter import PandocConverter
 from utils.docx_split import DocxSplitProcessor
 from utils.docx_merge import copy_all_to_beginning
 from utils.docx_update_toc_title import update_toc_title_xml
+from utils.convert_word_equations import replace_ole_with_images
 from docx.oxml.ns import qn
 
 # COM 组件可用性检测（用于页面方向拆分等功能）
@@ -113,7 +114,9 @@ class DocumentConverter:
         self.save_intermediate_files = False  # 是否保存中间文件的开关
         self.document_type = document_type  # 文档类型参数
         self.extracted_footer_content = None  # 存储提取的页脚内容
-        self.step0_processed_source = None  # 记录步骤0输出文件
+        self.step0_processed_source = None  # 记录步骤0/1.8的文件
+        self.step1_8_image_dir = None  # 步骤1.8图片目录
+        self.step1_8_output = None  # 步骤1.8输出文档
 
     def __enter__(self):
         """上下文管理器入口"""
@@ -369,6 +372,187 @@ class DocumentConverter:
         except Exception as e:
             print(f"❌ 页眉页脚替换过程中发生错误: {str(e)}")
             return template_file
+
+    def step1_8_convert_equations(self, source_file: str) -> str:
+        """
+        Step 1.8: 将竖版正文中的 OLE 公式转换为图片，供后续步骤使用。
+        """
+        print("-" * 50)
+        print("步骤1.8: 公式图片化处理")
+
+        try:
+            if not self.temp_dir:
+                raise ValueError("临时目录未初始化")
+
+            base_name = os.path.splitext(os.path.basename(source_file))[0]
+            output_path = os.path.join(self.temp_dir, f"{base_name}_step1_8_equation_images.docx")
+            image_dir = Path(self.temp_dir) / f"{base_name}_formula_images"
+            self.step1_8_image_dir = str(image_dir)
+
+            images = replace_ole_with_images(
+                docx_path=source_file,
+                output_docx_path=output_path,
+                output_img_dir=image_dir,
+                word_visible=False,
+            )
+
+            if images:
+                print(f"步骤1.8: 成功转换 {len(images)} 张公式图片")
+            else:
+                print("步骤1.8: 未检测到需要转换的公式，已生成副本文档继续后续流程。")
+
+            if self.save_intermediate_files and os.path.exists(output_path):
+                self._save_intermediate_file(output_path, "step1_8_equations", "equation_images")
+                if image_dir.exists():
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    archive_name = f"step1_8_equations_images_{timestamp}.zip"
+                    archive_path = Path(self.debug_output_dir) / archive_name
+                    try:
+                        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                            for img_file in image_dir.glob('**/*'):
+                                if img_file.is_file():
+                                    zf.write(img_file, arcname=img_file.name)
+                        print(f"   已保存公式图片压缩包: {archive_name}")
+                    except Exception as zip_err:
+                        print(f"   压缩公式图片失败: {zip_err}")
+
+            if os.path.exists(output_path):
+                self.step1_8_output = output_path
+                self.intermediate_files['step1_8_output'] = output_path
+            if images:
+                self.intermediate_files['step1_8_images'] = str(image_dir)
+
+            return output_path
+
+        except Exception as err:
+            print(f"步骤1.8: 图片转换发生错误，继续使用原文件。详细信息：{err}")
+            return source_file
+
+    def _table_signature(self, table) -> tuple:
+        signature = []
+        for row in table.rows:
+            row_text = []
+            for cell in row.cells:
+                # 取单元格内的纯文本，去掉换行和空白
+                row_text.append(cell.text.strip())
+            signature.append(tuple(row_text))
+        return tuple(signature)
+
+    def step12_remove_duplicate_tables(self, doc_path: str) -> str:
+        """
+        Step 12 预处理：删除与首张表格内容相同的后续表格。
+        """
+        print("-" * 50)
+        print("步骤12-预处理: 删除重复表格")
+
+        if not doc_path or not os.path.exists(doc_path):
+            print("步骤12-预处理: 未找到目标文档，跳过表格去重。")
+            return doc_path
+
+        try:
+            import docx
+        except ImportError:
+            print("步骤12-预处理: 未安装 python-docx，无法执行表格去重。")
+            return doc_path
+
+        try:
+            document = docx.Document(doc_path)
+        except Exception as err:
+            print(f"步骤12-预处理: 打开文档失败，原因: {err}")
+            return doc_path
+
+        tables = document.tables
+        if len(tables) <= 1:
+            print("步骤12-预处理: 表格数量不足，无需去重。")
+            return doc_path
+
+        try:
+            first_signature = self._table_signature(tables[0])
+        except Exception as err:
+            print(f"步骤12-预处理: 生成首张表格指纹失败，原因: {err}")
+            return doc_path
+
+        removed_count = 0
+        for table in list(tables)[1:]:
+            try:
+                if self._table_signature(table) == first_signature:
+                    parent = table._element.getparent()
+                    parent.remove(table._element)
+                    removed_count += 1
+            except Exception as err:
+                print(f"步骤12-预处理: 表格去重时发生错误，原因: {err}")
+
+        if removed_count == 0:
+            print("步骤12-预处理: 未发现重复表格。")
+            return doc_path
+
+        try:
+            document.save(doc_path)
+            print(f"步骤12-预处理: 已删除 {removed_count} 个重复表格。")
+        except Exception as err:
+            print(f"步骤12-预处理: 保存文档失败，原因: {err}")
+            return doc_path
+
+        self.intermediate_files['step12_table_dedup'] = doc_path
+        if self.save_intermediate_files:
+            self._save_intermediate_file(doc_path, "step12_table", "去重后")
+
+        return doc_path
+
+    def step12_remove_duplicate_phrase(self, doc_path: str, phrase: str = "各专业参加设计人员名单") -> str:
+        """
+        Step 12 预处理：删除重复出现的特定段落。
+        """
+        print("-" * 50)
+        print("步骤12-预处理: 删除重复段落")
+
+        if not doc_path or not os.path.exists(doc_path):
+            print("步骤12-预处理: 未找到目标文档，跳过段落去重。")
+            return doc_path
+
+        try:
+            import docx
+        except ImportError:
+            print("步骤12-预处理: 未安装 python-docx，无法执行段落去重。")
+            return doc_path
+
+        try:
+            document = docx.Document(doc_path)
+        except Exception as err:
+            print(f"步骤12-预处理: 打开文档失败，原因: {err}")
+            return doc_path
+
+        seen = False
+        removed = 0
+
+        for para in list(document.paragraphs):
+            if para.text.strip() != phrase:
+                continue
+
+            if not seen:
+                seen = True
+                continue
+
+            parent = para._element.getparent()
+            parent.remove(para._element)
+            removed += 1
+
+        if removed == 0:
+            print("步骤12-预处理: 未发现重复段落。")
+            return doc_path
+
+        try:
+            document.save(doc_path)
+            print(f"步骤12-预处理: 已删除 {removed} 个重复段落。")
+        except Exception as err:
+            print(f"步骤12-预处理: 保存文档失败，原因: {err}")
+            return doc_path
+
+        self.intermediate_files['step12_phrase_dedup'] = doc_path
+        if self.save_intermediate_files:
+            self._save_intermediate_file(doc_path, "step12_phrase", "段落去重后")
+
+        return doc_path
 
     def step1_split_document(self, source_file: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -2101,6 +2285,9 @@ class DocumentConverter:
             portrait_content_file, landscape_content_file = self.step1_5_split_by_orientation(content_file)
             content_file = portrait_content_file
 
+            # 步骤1.8: 仅针对竖版正文进行公式图片化
+            content_file = self.step1_8_convert_equations(content_file)
+
             # 步骤2: Pandoc转换
             pandoc_file = self.step2_pandoc_convert(content_file, template_file)
             if not pandoc_file:
@@ -2197,6 +2384,11 @@ class DocumentConverter:
                 library_number_advanced_format_success = self.step11_format_library_number_advanced(output_file)
                 if not library_number_advanced_format_success:
                     print("⚠️ 库号信息高级格式化失败，继续使用原有格式")
+
+                # 步骤12 预处理: 删除与首张表重复的表格
+                self.step12_remove_duplicate_tables(output_file)
+                # 步骤12 预处理: 删除重复段落
+                self.step12_remove_duplicate_phrase(output_file)
 
                 # 步骤12: 页眉页脚后处理
                 if self.step0_processed_source:

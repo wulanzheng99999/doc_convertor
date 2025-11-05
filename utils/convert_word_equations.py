@@ -1,179 +1,227 @@
-import win32com.client as win32
+from __future__ import annotations
+
 import os
 import time
 from pathlib import Path
+from typing import Iterable, List
+
+import win32com.client as win32
 
 try:
-    # 导入Pillow库中的ImageGrab，用于从剪贴板抓取图像
     from PIL import ImageGrab
 except ImportError:
-    print("错误：未找到 Pillow (PIL) 库。")
-    print("请先安装: pip install Pillow")
-    exit()
+    print("错误：未找到 Pillow (PIL) 库，请运行 `pip install Pillow` 后重试。")
+    raise SystemExit(1)
 
-# --- pywin32 COM 常量 ---
-wdInlineShapeEmbeddedOLEObject = 1  # 内嵌 OLE 对象
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None  # type: ignore[assignment]
 
-# --- 默认图片目录（项目 temp 子目录） ---
+# Word COM 常量
+WD_INLINE_SHAPE_EMBEDDED_OLE_OBJECT = 1
+
+# 默认图片输出目录：项目根目录下 temp/formula_images
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMAGE_DIR = PROJECT_ROOT / "temp" / "formula_images"
 
 
-def replace_ole_with_images(docx_path, output_docx_path, output_img_dir=None):
+def _ensure_path(path: os.PathLike[str] | str) -> Path:
+    """将路径转换为绝对 Path。"""
+    return Path(path).expanduser().resolve()
+
+
+def replace_ole_with_images(
+    docx_path: os.PathLike[str] | str,
+    output_docx_path: os.PathLike[str] | str,
+    output_img_dir: os.PathLike[str] | str | None = None,
+    *,
+    word_visible: bool = False,
+) -> List[str]:
     """
-    打开一个Word文档，遍历所有嵌入式 OLE 对象 (InlineShape OLE)，
-    将其截图保存为 PNG，然后用该 PNG 替换掉原 OLE 对象。
-    最后将修改后的文档另存为新文件。
+    将 Word 文档中的 OLE 内联对象（如公式）转换成嵌入式图片。
 
-    (第8版: 实现 OLE 对象的 "截图-删除-插入" 替换)
+    Args:
+        docx_path: 源文档路径。
+        output_docx_path: 输出文档路径。
+        output_img_dir: 图片输出目录，默认写入 temp/formula_images。
+        word_visible: 是否显示 Word UI，默认后台执行。
+
+    Returns:
+        List[str]: 所有生成图片的绝对路径。
     """
 
-    # 确保所有路径都是绝对路径
-    if not os.path.isabs(docx_path):
-        docx_path = os.path.abspath(docx_path)
-    if not os.path.isabs(output_docx_path):
-        output_docx_path = os.path.abspath(output_docx_path)
+    src = _ensure_path(docx_path)
+    dst = _ensure_path(output_docx_path)
+    image_dir = _ensure_path(output_img_dir) if output_img_dir else DEFAULT_IMAGE_DIR
 
-    if output_img_dir:
-        output_img_dir = Path(output_img_dir).expanduser().resolve()
-    else:
-        output_img_dir = DEFAULT_IMAGE_DIR
+    image_dir.mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
 
-    output_img_dir = output_img_dir.resolve()
-
-    # 1. 确保图片输出目录存在
-    output_img_dir.mkdir(parents=True, exist_ok=True)
-    print(f"图片将保存到: {output_img_dir}")
+    print(f"[公式转图片] 源文件: {src}")
+    print(f"[公式转图片] 输出文件: {dst}")
+    print(f"[公式转图片] 图片目录: {image_dir}")
 
     word = None
     doc = None
-    saved_image_paths = []
+    saved_images: List[str] = []
+    pythoncom_initialized = False
 
     try:
-        print("正在启动 Word 应用程序...")
-        word = win32.Dispatch("Word.Application")
-        word.Visible = True
+        if pythoncom:
+            pythoncom.CoInitialize()
+            pythoncom_initialized = True
+
+        try:
+            word = win32.Dispatch("Word.Application")
+        except Exception:
+            word = win32.DispatchEx("Word.Application")
+
+        word.Visible = word_visible
         word.DisplayAlerts = False
-        word.Activate()
+        word.AutomationSecurity = 3  # 3 = msoAutomationSecurityForceDisable
 
-        print(f"正在打开文档: {docx_path}")
-        doc = word.Documents.Open(docx_path)
-        print("文档打开成功。")
+        doc = word.Documents.Open(str(src))
+        print("[公式转图片] Word 已打开文档。")
 
-        # --- 遍历 InlineShapes 并替换 ---
-        print("正在遍历 InlineShapes 查找 OLE 对象并替换...")
         shapes = doc.InlineShapes
         shape_count = shapes.Count
-        found_ole_count = 0
+        replaced_count = 0
 
-        if shape_count > 0:
-            print(f"找到 {shape_count} 个 InlineShapes，正在检查...")
-            # 必须从后向前遍历，因为我们会删除和添加元素
-            for i in range(shape_count, 0, -1):
-                shape = None
+        if shape_count:
+            print(f"[公式转图片] 检测到 {shape_count} 个内联对象，开始处理。")
+        else:
+            print("[公式转图片] 未检测到内联对象。")
+
+        for index in range(shape_count, 0, -1):
+            try:
+                shape = shapes(index)
+            except Exception:
+                continue
+
+            try:
+                if shape.Type != WD_INLINE_SHAPE_EMBEDDED_OLE_OBJECT:
+                    continue
+
                 try:
-                    shape = shapes(i)
+                    prog_id = shape.OLEFormat.ProgID
+                except Exception:
+                    prog_id = "Unknown"
 
-                    # 检查是否是 OLE 对象
-                    if shape.Type == wdInlineShapeEmbeddedOLEObject:
+                print(f"  > 第 {index} 个对象：OLE 类型（ProgID={prog_id}），准备替换。")
 
-                        prog_id = "Unknown"
-                        try:
-                            prog_id = shape.OLEFormat.ProgID
-                        except Exception:
-                            pass
+                original_range = shape.Range
+                shape.Select()
+                word.Selection.CopyAsPicture()
+                time.sleep(0.1)  # 等待剪贴板刷新
 
-                        print(f"  > 找到 OLE 对象 (Shape {i}), ProgID: {prog_id}。正在替换...")
+                image = ImageGrab.grabclipboard()
+                if not image:
+                    print("    ! 剪贴板未捕获到图片，跳过该公式。")
+                    continue
 
-                        # 0. 【关键】获取 OLE 对象的准确位置 (Range)
-                        original_range = shape.Range
+                file_name = f"formula_shape_{index}.png"
+                save_path = image_dir / file_name
+                image.save(save_path)
+                saved_images.append(str(save_path))
 
-                        # 1. 选中形状并复制为图片
-                        shape.Select()
-                        word.Selection.CopyAsPicture()
-                        time.sleep(0.1)
+                shape.Delete()
 
-                        # 2. 从剪贴板抓取图像
-                        image = ImageGrab.grabclipboard()
+                new_shape = doc.InlineShapes.AddPicture(
+                    FileName=str(save_path),
+                    LinkToFile=False,
+                    SaveWithDocument=True,
+                    Range=original_range,
+                )
+                new_shape.LockAspectRatio = True
 
-                        if image:
-                            # 3. 保存图像到文件
-                            file_name = f"formula_shape_{i}.png"
-                            save_path = output_img_dir / file_name
-                            image.save(save_path)
-                            saved_image_paths.append(str(save_path))
+                replaced_count += 1
+            except Exception as err:
+                print(f"    ! Error processing shape #{index}: {err}")
 
-                            # 4. 【关键】删除原始 OLE 对象
-                            shape.Delete()
-
-                            # 5. 【关键】在原位置插入图片
-                            # LinkToFile=False (不链接文件), SaveWithDocument=True (嵌入文档)
-                            new_shape = doc.InlineShapes.AddPicture(
-                                FileName=str(save_path),
-                                LinkToFile=False,
-                                SaveWithDocument=True,
-                                Range=original_range
-                            )
-                            # (可选) 保持图片宽高比
-                            new_shape.LockAspectRatio = True
-
-                            found_ole_count += 1
-                        else:
-                            print(f"  > 警告: 复制 Shape {i} 到剪贴板失败。")
-
-                except Exception as e_shape:
-                    print(f"  > 错误: 处理 Shape {i} 时出错: {e_shape}")
-                    pass
-
-            print(f"步骤完成: 检查了 {shape_count} 个形状，成功替换 {found_ole_count} 个 OLE 对象。")
-
-            # 6. 【关键】另存为新文档
-            print(f"正在将修改后的文档另存为: {output_docx_path}")
-            doc.SaveAs(output_docx_path)
-
+        if replaced_count:
+                print(f"[公式转图片] 共替换 {replaced_count} 个 OLE 对象为图片。")
         else:
-            print("未找到 InlineShapes。")
+            print("[公式转图片] 未替换任何 OLE 对象。")
 
-
-    except Exception as e:
-        print(f"处理文档时出错: {e}")
-
+        print(f"[公式转图片] 正在保存文档到: {dst}")
+        doc.SaveAs(str(dst))
+    except Exception as exc:
+        print(f"[公式转图片] 处理文档时出错: {exc}")
+        raise
     finally:
-        if doc:
-            doc.Close()  # 关闭 (已保存的) 新文档
-            print("已关闭文档。")
-        if word:
-            word.Quit(0)
-            print("已退出 Word 应用程序。")
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+            print("[公式转图片] 文档已关闭。")
 
-    return saved_image_paths
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+            print("[公式转图片] Word 应用已退出。")
+            del word
+
+        if pythoncom_initialized:
+            try:
+                pythoncom.Uninitialize()
+            except Exception:
+                pass
+
+    return saved_images
 
 
-# --- 使用示例 ---
+def _default_output_path(input_path: Path) -> Path:
+    """默认输出路径：原名后缀 _equations."""
+    name, ext = os.path.splitext(input_path.name)
+    return input_path.with_name(f"{name}_equations{ext}")
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    import argparse
+    import inspect
+
+    parser = argparse.ArgumentParser(description="将 Word 文档中的公式（OLE）转换成图片。")
+    parser.add_argument("input", help="源 DOCX 文件路径。")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="转换后的 DOCX 输出路径，默认在原文件名后加 _equations。",
+    )
+    parser.add_argument(
+        "-d",
+        "--image-dir",
+        help="图片输出目录，默认写入项目 temp/formula_images。",
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        help="是否在前台显示 Word 窗口，默认后台运行。",
+    )
+
+    args = parser.parse_args(tuple(argv) if argv is not None else None)
+
+    input_path = _ensure_path(args.input)
+    output_path = _ensure_path(args.output) if args.output else _default_output_path(input_path)
+    image_dir = _ensure_path(args.image_dir) if args.image_dir else None
+
+    images = replace_ole_with_images(
+        docx_path=input_path,
+        output_docx_path=output_path,
+        output_img_dir=image_dir,
+        word_visible=args.visible,
+    )
+
+    print("\nSummary")
+    print("-------")
+    print(f"Processed document : {output_path}")
+    print(f"Images saved       : {len(images)}")
+    if images:
+        print(f"Image directory    : {Path(images[0]).parent}")
+
+
 if __name__ == "__main__":
-
-    # 1. 定义原始文件路径
-    file_path = r"E:\1文档\鲅鱼圈炼焦节能泵改造可研汇1111111.docx"
-
-    # 2. 定义新文件的保存路径 (!!!)
-    # 我们可以简单地在原文件名后添加 "_replaced"
-    base_name = os.path.basename(file_path)
-    dir_name = os.path.dirname(file_path)
-    name, ext = os.path.splitext(base_name)
-
-    new_file_name = f"{name}_replaced{ext}"
-    new_file_path = os.path.join(dir_name, new_file_name)
-
-    if os.path.exists(file_path):
-        images = replace_ole_with_images(file_path, new_file_path)
-
-        if images:
-            print("\n--- 替换完成 ---")
-            image_dir = Path(images[0]).parent
-            print(f"已创建 {len(images)} 张图片，保存于: {image_dir}")
-            print("已将原文档中的公式替换为图片，并另存为：")
-            print(new_file_path)
-        else:
-            print("\n(v8) 未找到可替换的 OLE 对象。")
-    else:
-        print(f"错误：文件未找到! \n请检查路径: {file_path}")
+    main()
