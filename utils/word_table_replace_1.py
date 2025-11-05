@@ -1,23 +1,44 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-方案A（主文流+富文本赋值版）：
-- 仅统计主文流（wdMainTextStory）里的表格，源/目标口径一致
-- 按主文流出现顺序配对：源第 n 张 ↔ 目标第 n 张
-- 按“目标表在文中的起点”倒序执行，避免删除导致对象/索引漂移
-- 复制逻辑采用 Word COM 富文本赋值：rng.FormattedText = src_tbl.Range.FormattedText
-依赖：pip install pywin32
-环境：Windows + Microsoft Word
+Word 表格替换（优化版）：
+- 不再使用 doc.CopyStylesFromTemplate()，避免覆盖目标文档的标题/目录/列表等全局样式。
+- 仅用 rng.FormattedText = src_tbl.Range.FormattedText 复制表格内容与直接格式。
+- 如需保留源表格依赖的“少数自定义样式”，可按需调用 OrganizerCopy 只拷那几项（可选）。
+
+依赖：
+    pip install pywin32
+运行环境：
+    Windows + Microsoft Word（桌面版）
 """
 
 from __future__ import annotations
 
 import contextlib
-import os
-import time
 import shutil
-from pathlib import Path
+import time
 from copy import deepcopy
-from typing import Dict, List, Set, Tuple
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# --- 配置 (保持不变) ---
+TEMPLATE_DOC_PATH = "../temp/step0_preprocess_标题预处理_20251104_235356.docx"
+SOURCE_DOC_PATH   = "../temp/step11_library_number_高级格式化完成_20251104_235500.docx"
+OUTPUT_DOC_PATH   = "../output/formatted_document——1.docx"
+CLEANED_DOC_PATH  = "output/cleaned_document.docx"
+
+try:
+    from docx import Document
+    from docx.oxml.ns import qn
+except Exception:
+    Document = None
+    qn = None
+
+STYLE_COPY_ENABLED = True
+STYLE_TYPES_TO_COPY = {"paragraph", "character", "table"}
+STYLE_CUSTOM_ONLY_TYPES = {"paragraph", "character"}
+STYLE_ID_EXCLUDE_PREFIXES = ("Heading", "TOC")
+STYLE_ID_EXCLUDE: set[str] = set()
+STYLE_SOURCE_OVERRIDE: str | None = None
 
 try:
     import pythoncom
@@ -32,56 +53,6 @@ try:
 except Exception:
     print("⚠️ 未找到 pywintypes，pywin32 可能安装不完整。")
     pywintypes = None
-
-
-
-try:
-    from docx import Document
-    from docx.oxml.ns import qn
-except Exception:
-    Document = None
-    qn = None
-
-
-
-# 常量兼容处理
-WD_STYLE_TYPE_TABLE = getattr(C, 'wdStyleTypeTable', 3)
-WD_ORGANIZER_OBJECT_STYLES = getattr(C, 'wdOrganizerObjectStyles', 0)
-
-# --- 配置 ---
-TEMPLATE_DOC_PATH = "../temp/step0_preprocess_标题预处理_20251104_235356.docx"
-SOURCE_DOC_PATH = "../temp/step11_library_number_高级格式化完成_20251104_235500.docx"
-OUTPUT_DOC_PATH = "../output/formatted_document——1.docx"
-CLEANED_DOC_PATH = "output/cleaned_document.docx"
-
-STYLE_SYNC_ENABLED = True
-STYLE_SYNC_INCLUDE_TYPES = {WD_STYLE_TYPE_TABLE}
-STYLE_SYNC_EXCLUDE_PREFIXES: tuple[str, ...] = ("Heading", "TOC")
-STYLE_SYNC_EXTRA_NAMES: Set[str] = set()
-STYLE_SYNC_VERBOSE = False
-
-
-
-STYLE_BACKUP_ENABLED = True
-
-STYLE_BACKUP_TYPES = {"paragraph", "character", "table"}
-
-# 为空则意味着所有类型都会备份（包括被自定义过的内置样式）
-STYLE_BACKUP_CUSTOM_ONLY_TYPES: Set[str] = {"paragraph", "character"}
-STYLE_BACKUP_LIMIT_TO_TABLE_USAGE = True
-STYLE_BACKUP_INCLUDE_BASE_STYLES = False
-
-STYLE_BACKUP_EXCLUDE_PREFIXES: tuple[str, ...] = ("Heading", "TOC")
-
-STYLE_BACKUP_EXCLUDE: Set[str] = set()
-
-STYLE_BACKUP_SOURCE_OVERRIDE: str | None = None
-
-STYLE_BACKUP_VERBOSE = False
-
-STYLE_BACKUP_EXTRA_NAMES: Set[str] = set()
-
-
 
 RETRY_MAX = 3
 
@@ -128,186 +99,84 @@ def _retry_call(fn, *args, **kwargs):
             raise
 
 
-def _iter_collection(col):
-    count = getattr(col, "Count", 0)
-    for index in range(1, count + 1):
-        with contextlib.suppress(Exception):
-            yield col(index)
+def _get_tables_main_list(doc) -> List:
+    rng = _retry_call(lambda: doc.StoryRanges(C.wdMainTextStory))
+    if rng is None:
+        return []
+    tables_dispatch = _retry_call(lambda: getattr(rng, "Tables", None))
+    if tables_dispatch is None:
+        return []
+    tables = [t for t in tables_dispatch]
+    tables.sort(key=lambda t: t.Range.Start)
+    return tables
 
 
-def _style_name_should_exclude(name: str) -> bool:
-    if not name:
-        return True
-    return any(name.startswith(prefix) for prefix in STYLE_SYNC_EXCLUDE_PREFIXES)
-
-
-def _copy_whitelisted_styles(app, doc_src, doc_out):
-    if not STYLE_SYNC_ENABLED:
-        return
-
-    try:
-        src_styles = _retry_call(lambda: doc_src.Styles)
-    except Exception as err:
-        print(f"⚠️ 无法读取源文档样式：{err}")
-        return
-
-    names: Set[str] = set(STYLE_SYNC_EXTRA_NAMES)
-    for style in _iter_collection(src_styles):
-        with contextlib.suppress(Exception):
-            if getattr(style, "BuiltIn", False):
-                continue
-            style_type = style.Type
-            if style_type not in STYLE_SYNC_INCLUDE_TYPES:
-                continue
-            name = str(style.NameLocal or style.Name)
-            if _style_name_should_exclude(name):
-                continue
-            names.add(name)
-
-    if not names:
-        return
-
-    for name in sorted(names):
-        try:
-            _retry_call(
-                app.OrganizerCopy,
-                doc_src.FullName,
-                doc_out.FullName,
-                name,
-                WD_ORGANIZER_OBJECT_STYLES,
-            )
-            if STYLE_SYNC_VERBOSE:
-                print(f"   · 已同步样式：{name}")
-        except Exception as copy_err:
-            print(f"⚠️ 样式同步失败：{name} -> {copy_err}")
-
-
-def _collect_table_style_ids(doc_path: str) -> Set[str]:
-    if Document is None:
-        return set()
-    path_obj = Path(doc_path)
-    if not path_obj.exists():
-        return set()
-    if not _wait_for_file_access(path_obj, mode="read"):
-        return set()
-
-    doc = Document(str(path_obj))
-    collected: Set[str] = set(STYLE_BACKUP_EXTRA_NAMES)
-
-    def add_style(style):
-        if style is None:
-            return
-        while style is not None:
-            style_id = getattr(style, "style_id", None)
-            if not style_id:
-                break
-            if any(style_id.startswith(prefix) for prefix in STYLE_BACKUP_EXCLUDE_PREFIXES):
-                pass
-            elif style_id not in STYLE_BACKUP_EXCLUDE:
-                collected.add(style_id)
-            if not STYLE_BACKUP_INCLUDE_BASE_STYLES:
-                break
-            style = getattr(style, "base_style", None)
-
-    for table in doc.tables:
-        add_style(getattr(table, "style", None))
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    add_style(getattr(paragraph, "style", None))
-                    for run in paragraph.runs:
-                        add_style(getattr(run, "style", None))
-
-    return collected
-
-
-def _backup_docx_styles(doc_path: str, allowed_ids: Set[str] | None = None) -> Dict[str, object]:
-    if not STYLE_BACKUP_ENABLED:
+def _backup_docx_styles(doc_path: str) -> Dict[str, object]:
+    if not STYLE_COPY_ENABLED:
         return {}
     if Document is None or qn is None:
-        if STYLE_BACKUP_VERBOSE:
-            print("⚠️ 未安装 python-docx，跳过样式备份。")
+        print("⚠️ 未找到 python-docx，跳过样式备份。")
         return {}
-    path_obj = Path(doc_path)
-    if not path_obj.exists():
+    path = Path(doc_path)
+    if not path.exists():
         print(f"⚠️ 样式备份失败：未找到文档 {doc_path}")
         return {}
-    if not _wait_for_file_access(path_obj, mode="read"):
-        print(f"⚠️ 样式备份失败：暂时无法读取 {doc_path}")
-        return {}
 
-    doc = Document(str(path_obj))
+    doc = Document(str(path))
     styles_element = doc.styles.element
-    collected: Dict[str, object] = {}
-
-    for node in styles_element.findall(qn("w:style")):
-        style_id = node.get(qn("w:styleId"))
+    results: Dict[str, object] = {}
+    style_nodes = styles_element.findall(qn("w:style"))
+    for style in style_nodes:
+        style_id = style.get(qn("w:styleId"))
         if not style_id:
             continue
-        style_type = node.get(qn("w:type"))
-        if allowed_ids is not None and style_id not in allowed_ids:
+        style_type = style.get(qn("w:type"))
+        if STYLE_TYPES_TO_COPY and style_type not in STYLE_TYPES_TO_COPY:
             continue
-        if STYLE_BACKUP_TYPES and style_type not in STYLE_BACKUP_TYPES:
+        if any(style_id.startswith(prefix) for prefix in STYLE_ID_EXCLUDE_PREFIXES):
             continue
-        if any(style_id.startswith(prefix) for prefix in STYLE_BACKUP_EXCLUDE_PREFIXES):
-            continue
-        if style_id in STYLE_BACKUP_EXCLUDE:
+        if style_id in STYLE_ID_EXCLUDE:
             continue
         if (
-            STYLE_BACKUP_CUSTOM_ONLY_TYPES
-            and style_type in STYLE_BACKUP_CUSTOM_ONLY_TYPES
-            and node.get(qn("w:customStyle")) != "1"
+            STYLE_CUSTOM_ONLY_TYPES
+            and style_type in STYLE_CUSTOM_ONLY_TYPES
+            and style.get(qn("w:customStyle")) != "1"
         ):
             continue
-        collected[style_id] = deepcopy(node)
-
-    if STYLE_BACKUP_VERBOSE:
-        print(f"🔒 已备份样式 {len(collected)} 项")
-    return collected
+        results[style_id] = deepcopy(style)
+    return results
 
 
 def _restore_docx_styles(doc_path: str, styles: Dict[str, object]):
     if not styles:
         return
     if Document is None or qn is None:
-        if STYLE_BACKUP_VERBOSE:
-            print("⚠️ 未安装 python-docx，跳过样式回写。")
+        print("⚠️ 未找到 python-docx，无法回写样式。")
         return
-    path_obj = Path(doc_path)
-    if not path_obj.exists():
+    path = Path(doc_path)
+    if not path.exists():
         print(f"⚠️ 样式回写失败：未找到文档 {doc_path}")
         return
-    if not _wait_for_file_access(path_obj, mode="read"):
+    if not _wait_for_file_access(path, mode="read"):
         print(f"⚠️ 样式回写失败：暂时无法读取 {doc_path}")
         return
 
-    doc = Document(str(path_obj))
+    doc = Document(str(path))
     styles_element = doc.styles.element
     existing = {
         node.get(qn("w:styleId")): node
         for node in styles_element.findall(qn("w:style"))
         if node.get(qn("w:styleId"))
     }
-
     for style_id, node in styles.items():
         current = existing.get(style_id)
         if current is not None:
             styles_element.remove(current)
         styles_element.append(deepcopy(node))
-
-    if not _wait_for_file_access(path_obj, mode="write"):
+    if not _wait_for_file_access(path, mode="write"):
         print(f"⚠️ 样式回写失败：暂时无法写入 {doc_path}")
         return
-    doc.save(str(path_obj))
-    if STYLE_BACKUP_VERBOSE:
-        print(f"🔁 已回写样式 {len(styles)} 项")
-
-
-def _get_tables_main_list(doc) -> List:
-    rng = _retry_call(lambda: doc.StoryRanges(C.wdMainTextStory))
-    tables = [t for t in _retry_call(lambda: rng.Tables)]
-    tables.sort(key=lambda t: t.Range.Start)
-    return tables
+    doc.save(str(path))
 
 
 def _prepare_output_document(dst: str, outp: str, retries: int = 5):
@@ -341,52 +210,6 @@ def _prepare_output_document(dst: str, outp: str, retries: int = 5):
 
     if last_error:
         raise last_error
-
-
-def _copy_table_direct_font(src_tbl, dst_tbl):
-    if not src_tbl or not dst_tbl:
-        return
-    src_rows = _retry_call(lambda: src_tbl.Rows.Count)
-    dst_rows = _retry_call(lambda: dst_tbl.Rows.Count)
-    src_cols = _retry_call(lambda: src_tbl.Columns.Count)
-    dst_cols = _retry_call(lambda: dst_tbl.Columns.Count)
-    rows = min(src_rows, dst_rows)
-    cols = min(src_cols, dst_cols)
-
-    for r in range(1, rows + 1):
-        for c in range(1, cols + 1):
-            try:
-                src_cell = _retry_call(lambda: src_tbl.Cell(r, c))
-                dst_cell = _retry_call(lambda: dst_tbl.Cell(r, c))
-            except Exception:
-                continue
-            _copy_range_font(src_cell.Range, dst_cell.Range)
-
-
-def _copy_range_font(src_range, dst_range):
-    try:
-        dst_font = _retry_call(lambda: dst_range.Font)
-        src_font = _retry_call(lambda: src_range.Font)
-    except Exception:
-        return
-
-    try:
-        dst_range.ParagraphFormat.Alignment = src_range.ParagraphFormat.Alignment
-    except Exception:
-        pass
-
-    attributes = [
-        "Name", "NameAscii", "NameFarEast", "NameOther",
-        "Size", "Bold", "Italic", "Underline",
-        "Color", "ColorIndex", "Spacing", "Scaling",
-        "Position", "Kerning", "Shadow", "Outline",
-        "Emboss", "Engrave", "StrikeThrough", "DoubleStrikeThrough",
-        "Subscript", "Superscript"
-    ]
-
-    for attr in attributes:
-        with contextlib.suppress(Exception):
-            setattr(dst_font, attr, getattr(src_font, attr))
 
 
 def _wait_for_file_access(path: Path, mode: str, timeout: float = 10.0, interval: float = 0.3) -> bool:
@@ -423,7 +246,6 @@ def _hard_replace_table(doc_out, src_tbl, dst_tbl) -> bool:
             rng.FormattedText = src_fmt
 
         _retry_call(_assign)
-        _copy_table_direct_font(src_tbl, rng.Tables(1))
         return True
     except Exception as e:
         print(f"    ❌ 硬替换失败：{e}")
@@ -517,7 +339,7 @@ def _open_documents_with_restart(src: str, dst: str, outp: str) -> Tuple:
             if doc_out is None:
                 raise ValueError("DOC_OPEN_NONE")
 
-            _copy_whitelisted_styles(app, doc_src, doc_out)
+            # Skip copying styles from the template so target document keeps its own heading/toc styles.
 
             return app, doc_src, doc_out
 
@@ -544,22 +366,17 @@ def replace_tables_in_mainstory_all(original_path: str, edited_path: str, output
     outp = _abs(output_path)
 
     if not Path(src).exists():
-        print(f"? ԭ始文档不存在：{src}")
+        print(f'⚠️ 原始文档不存在：{src}')
         return False, 0
     if not Path(dst).exists():
-        print(f"? 目标文档不存在：{dst}")
+        print(f'⚠️ 目标文档不存在：{dst}')
         return False, 0
     Path(outp).parent.mkdir(parents=True, exist_ok=True)
 
     style_backup: Dict[str, object] = {}
-    if STYLE_BACKUP_ENABLED:
-        style_source_path = STYLE_BACKUP_SOURCE_OVERRIDE or src
-        allowed_ids = None
-        if STYLE_BACKUP_LIMIT_TO_TABLE_USAGE:
-            allowed_ids = _collect_table_style_ids(_abs(style_source_path))
-            if not allowed_ids:
-                allowed_ids = None
-        style_backup = _backup_docx_styles(_abs(style_source_path), allowed_ids) if (allowed_ids or STYLE_BACKUP_EXTRA_NAMES) else {}
+    if STYLE_COPY_ENABLED:
+        style_source_path = _abs(STYLE_SOURCE_OVERRIDE) if STYLE_SOURCE_OVERRIDE else src
+        style_backup = _backup_docx_styles(style_source_path)
 
     pythoncom_initialized = False
     if pythoncom:
@@ -580,44 +397,44 @@ def replace_tables_in_mainstory_all(original_path: str, edited_path: str, output
         dst_tbls = _get_tables_main_list(doc_out)
         n = min(len(src_tbls), len(dst_tbls))
 
-        print("?? ɨ���������еı���")
-        print(f"�� 源（主文流）：{len(src_tbls)} 张表")
-        print(f"�� 目标（主文流）：{len(dst_tbls)} 张表")
+        print('📋 扫描主文流中的表格…')
+        print(f'  · 源（主文流）：{len(src_tbls)} 张表')
+        print(f'  · 目标（主文流）：{len(dst_tbls)} 张表')
 
         if n == 0:
-            print("?? 主文流一侧无表格，无需替换。")
+            print('⚠️ 主文流一侧无表格，无需替换。')
             _retry_call(doc_out.Save)
             success = True
-            should_restore_styles = bool(style_backup)
+            should_restore_styles = True
         else:
             jobs = [(src_tbls[i], dst_tbls[i]) for i in range(n)]
             jobs.sort(key=lambda pair: pair[1].Range.Start, reverse=True)
 
-            print(f"�� 计划替换：{n} 项（按目标表在文中的起点倒序执行）")
+            print(f'  · 计划替换：{n} 项（按目标表在文中的起点倒序执行）')
             for idx, (s, d) in enumerate(jobs[:8], 1):
-                print(f"  �� #{idx} 源Start={s.Range.Start} → 目Start={d.Range.Start}")
+                print(f'    - #{idx} 源Start={s.Range.Start} → 目标Start={d.Range.Start}')
             if n > 8:
-                print(f"  �� …… 其余 {n} 项")
+                print(f'    - …其余 {n - 8} 项')
 
             for s_tbl, d_tbl in jobs:
                 if _hard_replace_table(doc_out, s_tbl, d_tbl):
                     replaced += 1
-                    print("     ✅ 成功")
+                    print('      ✓ 成功')
                 else:
-                    print("     ❌ 失败")
+                    print('      ✗ 失败')
 
             try:
                 _retry_call(doc_out.Save)
             except Exception:
                 _retry_call(doc_out.SaveAs, outp, FileFormat=12)
 
-            print(f"[OK] 已保存：{outp}")
-            print(f"   - 完成替换：{replaced}/{n}")
+            print(f'[OK] 已保存：{outp}')
+            print(f'   - 完成替换：{replaced}/{n}')
             success = True
-            should_restore_styles = bool(style_backup)
+            should_restore_styles = True
 
     except Exception as e:
-        print(f"? 执行出错：{e}")
+        print(f'❌ 执行出错：{e}')
         import traceback
 
         traceback.print_exc()
@@ -632,15 +449,11 @@ def replace_tables_in_mainstory_all(original_path: str, edited_path: str, output
     if should_restore_styles and style_backup:
         try:
             _restore_docx_styles(outp, style_backup)
-            if STYLE_BACKUP_VERBOSE:
-                print("🔁 已回写自定义样式。")
+            print('🔁 已回写原文自定义样式（python-docx）。')
         except Exception as style_err:
-            print(f"⚠️ 样式回写失败：{style_err}")
+            print(f'⚠️ 样式回写失败：{style_err}')
 
     return success, replaced
-
-
-
 
 def replace_tables(src_path: str, dst_path: str, out_path: str):
     replace_tables_in_mainstory_all(src_path, dst_path, out_path)
